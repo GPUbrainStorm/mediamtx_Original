@@ -199,12 +199,13 @@ func (s *httpServer) onWHIPPost(ctx *gin.Context, pathName string, publish bool)
 	}
 
 	ctx.Writer.Header().Set("Content-Type", "application/sdp")
-	ctx.Writer.Header().Set("Access-Control-Expose-Headers", "ETag, ID, Accept-Patch, Link, Location")
+	ctx.Writer.Header().Set("Access-Control-Expose-Headers", "ETag, ID, Accept-Patch, Link, Location, WHEP")
 	ctx.Writer.Header().Set("ETag", "*")
 	ctx.Writer.Header().Set("ID", res.sx.uuid.String())
 	ctx.Writer.Header().Set("Accept-Patch", "application/trickle-ice-sdpfrag")
 	ctx.Writer.Header()["Link"] = webrtc.LinkHeaderMarshal(servers)
 	ctx.Writer.Header().Set("Location", sessionLocation(publish, pathName, res.sx.secret))
+	ctx.Writer.Header().Set("WHEP", "https://webrtc3.arabesports.com:8889/" + pathName + "/whep")
 	ctx.Writer.WriteHeader(http.StatusCreated)
 	ctx.Writer.Write(res.answer)
 }
