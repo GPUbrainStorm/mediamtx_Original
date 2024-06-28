@@ -2,6 +2,7 @@ package webrtc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -9,15 +10,15 @@ import (
 
 	"github.com/pion/ice/v2"
 	"github.com/pion/interceptor"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 
+	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 const (
-	webrtcHandshakeTimeout   = 10 * time.Second
-	webrtcTrackGatherTimeout = 2 * time.Second
-	webrtcStreamID           = "mediamtx"
+	webrtcStreamID = "mediamtx"
 )
 
 func stringInSlice(a string, list []string) bool {
@@ -27,6 +28,37 @@ func stringInSlice(a string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// TracksAreValid checks whether tracks in the SDP are valid
+func TracksAreValid(medias []*sdp.MediaDescription) error {
+	videoTrack := false
+	audioTrack := false
+
+	for _, media := range medias {
+		switch media.MediaName.Media {
+		case "video":
+			if videoTrack {
+				return fmt.Errorf("only a single video and a single audio track are supported")
+			}
+			videoTrack = true
+
+		case "audio":
+			if audioTrack {
+				return fmt.Errorf("only a single video and a single audio track are supported")
+			}
+			audioTrack = true
+
+		default:
+			return fmt.Errorf("unsupported media '%s'", media.MediaName.Media)
+		}
+	}
+
+	if !videoTrack && !audioTrack {
+		return fmt.Errorf("no valid tracks count")
+	}
+
+	return nil
 }
 
 type trackRecvPair struct {
@@ -39,6 +71,8 @@ type PeerConnection struct {
 	ICEServers            []webrtc.ICEServer
 	ICEUDPMux             ice.UDPMux
 	ICETCPMux             ice.TCPMux
+	HandshakeTimeout      conf.StringDuration
+	TrackGatherTimeout    conf.StringDuration
 	LocalRandomUDP        bool
 	IPsFromInterfaces     bool
 	IPsFromInterfacesList []string
@@ -94,6 +128,9 @@ func (co *PeerConnection) Start() error {
 	mediaEngine := &webrtc.MediaEngine{}
 
 	if co.Publish {
+		videoSetupped := false
+		audioSetupped := false
+
 		for _, tr := range co.OutgoingTracks {
 			params, err := tr.codecParameters()
 			if err != nil {
@@ -103,11 +140,40 @@ func (co *PeerConnection) Start() error {
 			var codecType webrtc.RTPCodecType
 			if tr.isVideo() {
 				codecType = webrtc.RTPCodecTypeVideo
+				videoSetupped = true
 			} else {
 				codecType = webrtc.RTPCodecTypeAudio
+				audioSetupped = true
 			}
 
 			err = mediaEngine.RegisterCodec(params, codecType)
+			if err != nil {
+				return err
+			}
+		}
+
+		// always register at least a video and a audio codec
+		// otherwise handshake will fail or audio will be muted on some clients (like Firefox)
+		if !videoSetupped {
+			err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:  webrtc.MimeTypeVP8,
+					ClockRate: 90000,
+				},
+				PayloadType: 96,
+			}, webrtc.RTPCodecTypeVideo)
+			if err != nil {
+				return err
+			}
+		}
+		if !audioSetupped {
+			err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:  webrtc.MimeTypePCMU,
+					ClockRate: 8000,
+				},
+				PayloadType: 0,
+			}, webrtc.RTPCodecTypeAudio)
 			if err != nil {
 				return err
 			}
@@ -260,8 +326,8 @@ func (co *PeerConnection) SetAnswer(answer *webrtc.SessionDescription) error {
 }
 
 // AddRemoteCandidate adds a remote candidate.
-func (co *PeerConnection) AddRemoteCandidate(candidate webrtc.ICECandidateInit) error {
-	return co.wr.AddICECandidate(candidate)
+func (co *PeerConnection) AddRemoteCandidate(candidate *webrtc.ICECandidateInit) error {
+	return co.wr.AddICECandidate(*candidate)
 }
 
 // CreateFullAnswer creates a full answer.
@@ -276,8 +342,8 @@ func (co *PeerConnection) CreateFullAnswer(
 
 	answer, err := co.wr.CreateAnswer(nil)
 	if err != nil {
-		if err.Error() == "unable to populate media section, RTPSender created with no codecs" {
-			return nil, fmt.Errorf("track codecs are not supported by remote")
+		if errors.Is(err, webrtc.ErrSenderWithNoCodecs) {
+			return nil, fmt.Errorf("codecs not supported by client")
 		}
 		return nil, err
 	}
@@ -287,7 +353,7 @@ func (co *PeerConnection) CreateFullAnswer(
 		return nil, err
 	}
 
-	err = co.WaitGatheringDone(ctx)
+	err = co.waitGatheringDone(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -295,8 +361,7 @@ func (co *PeerConnection) CreateFullAnswer(
 	return co.wr.LocalDescription(), nil
 }
 
-// WaitGatheringDone waits until candidate gathering is complete.
-func (co *PeerConnection) WaitGatheringDone(ctx context.Context) error {
+func (co *PeerConnection) waitGatheringDone(ctx context.Context) error {
 	for {
 		select {
 		case <-co.NewLocalCandidate():
@@ -312,7 +377,7 @@ func (co *PeerConnection) WaitGatheringDone(ctx context.Context) error {
 func (co *PeerConnection) WaitUntilConnected(
 	ctx context.Context,
 ) error {
-	t := time.NewTimer(webrtcHandshakeTimeout)
+	t := time.NewTimer(time.Duration(co.HandshakeTimeout))
 	defer t.Stop()
 
 outer:
@@ -333,19 +398,21 @@ outer:
 }
 
 // GatherIncomingTracks gathers incoming tracks.
-func (co *PeerConnection) GatherIncomingTracks(
-	ctx context.Context,
-	maxCount int,
-) ([]*IncomingTrack, error) {
+func (co *PeerConnection) GatherIncomingTracks(ctx context.Context) ([]*IncomingTrack, error) {
+	var sdp sdp.SessionDescription
+	sdp.Unmarshal([]byte(co.wr.RemoteDescription().SDP)) //nolint:errcheck
+
+	maxTrackCount := len(sdp.MediaDescriptions)
+
 	var tracks []*IncomingTrack
 
-	t := time.NewTimer(webrtcTrackGatherTimeout)
+	t := time.NewTimer(time.Duration(co.TrackGatherTimeout))
 	defer t.Stop()
 
 	for {
 		select {
 		case <-t.C:
-			if maxCount == 0 && len(tracks) != 0 {
+			if len(tracks) != 0 {
 				return tracks, nil
 			}
 			return nil, fmt.Errorf("deadline exceeded while waiting tracks")
@@ -357,7 +424,7 @@ func (co *PeerConnection) GatherIncomingTracks(
 			}
 			tracks = append(tracks, track)
 
-			if len(tracks) == maxCount || len(tracks) >= 2 {
+			if len(tracks) >= maxTrackCount {
 				return tracks, nil
 			}
 

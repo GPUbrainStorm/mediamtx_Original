@@ -32,11 +32,13 @@ func TestSource(t *testing.T) {
 		ChannelCount: 2,
 	}}}
 	pc := &webrtc.PeerConnection{
-		LocalRandomUDP:    true,
-		IPsFromInterfaces: true,
-		Publish:           true,
-		OutgoingTracks:    outgoingTracks,
-		Log:               test.NilLogger,
+		LocalRandomUDP:     true,
+		IPsFromInterfaces:  true,
+		Publish:            true,
+		HandshakeTimeout:   conf.StringDuration(10 * time.Second),
+		TrackGatherTimeout: conf.StringDuration(2 * time.Second),
+		OutgoingTracks:     outgoingTracks,
+		Log:                test.NilLogger,
 	}
 	err := pc.Start()
 	require.NoError(t, err)
@@ -119,11 +121,11 @@ func TestSource(t *testing.T) {
 	te := test.NewSourceTester(
 		func(p defs.StaticSourceParent) defs.StaticSource {
 			return &Source{
-				ResolvedSource: "whep://localhost:9003/my/resource",
-				ReadTimeout:    conf.StringDuration(10 * time.Second),
-				Parent:         p,
+				ReadTimeout: conf.StringDuration(10 * time.Second),
+				Parent:      p,
 			}
 		},
+		"whep://localhost:9003/my/resource",
 		&conf.Path{},
 	)
 	defer te.Close()
